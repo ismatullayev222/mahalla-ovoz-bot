@@ -4,6 +4,8 @@ import json
 import sqlite3
 import asyncio
 
+from database import init_db
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -373,6 +375,9 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def main():
+    # Yangi ma'lumotlar bazasi jadvallarini yaratish
+    init_db()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
