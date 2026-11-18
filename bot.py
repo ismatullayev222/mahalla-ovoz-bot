@@ -4,7 +4,7 @@ import json
 import sqlite3
 import asyncio
 
-from database import init_db
+from database import init_db, create_poll, get_all_polls, get_poll
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -84,12 +84,80 @@ def is_admin(user_id):
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Savolni o'zgartirish", callback_data="admin_question")],
-        [InlineKeyboardButton("📝 Javoblarni o'zgartirish", callback_data="admin_options")],
-        [InlineKeyboardButton("📊 Natijalarni ko'rish", callback_data="admin_results")],
+        [InlineKeyboardButton("➕ Yangi opros yaratish", callback_data="admin_new_poll")],
+        [InlineKeyboardButton("📋 Barcha oproslar", callback_data="admin_all_polls")],
+        [InlineKeyboardButton("✏️ Eski savolni o'zgartirish", callback_data="admin_question")],
+        [InlineKeyboardButton("📝 Eski javoblarni o'zgartirish", callback_data="admin_options")],
+        [InlineKeyboardButton("📊 Eski natijalarni ko'rish", callback_data="admin_results")],
         [InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_cancel")]
     ])
 
+async def new_poll_start(query, context):
+    context.user_data["new_poll"] = {}
+    context.user_data["admin_action"] = "poll_title"
+
+    await query.edit_message_text(
+        "➕ YANGI OPROS YARATISH\n\n"
+        "Avval opros nomini yuboring:"
+    )
+
+
+async def show_all_polls(query):
+    polls = get_all_polls()
+
+    if not polls:
+        await query.edit_message_text(
+            "Hozircha oproslar mavjud emas.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin_back")]
+            ])
+        )
+        return
+
+    keyboard = []
+
+    for poll in polls:
+        status = "🟢" if poll["status"] == "active" else "🔴"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status} {poll['title']}",
+                callback_data=f"admin_view_poll_{poll['id']}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Admin panel", callback_data="admin_back")
+    ])
+
+    await query.edit_message_text(
+        "📋 BARCHA OPROSLAR:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_poll_details(query, poll_id, context):
+    poll = get_poll(poll_id)
+
+    if not poll:
+        await query.edit_message_text("Opros topilmadi.")
+        return
+
+    bot_username = context.bot.username
+
+    link = f"https://t.me/{bot_username}?start=poll_{poll_id}"
+
+    keyboard = [
+        [InlineKeyboardButton("🔗 Opros havolasini ochish", url=link)],
+        [InlineKeyboardButton("⬅️ Barcha oproslar", callback_data="admin_all_polls")]
+    ]
+
+    await query.edit_message_text(
+        f"📊 {poll['title']}\n\n"
+        f"❓ {poll['question']}\n\n"
+        f"Holati: {poll['status']}\n\n"
+        f"🔗 Havola:\n{link}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def is_subscriber(bot, user_id):
     try:
@@ -105,7 +173,46 @@ async def is_subscriber(bot, user_id):
         return False
 
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+
+    if args and args[0].startswith("poll_"):
+        try:
+            poll_id = int(args[0].replace("poll_", ""))
+        except ValueError:
+            await update.message.reply_text("Opros havolasi noto'g'ri.")
+            return
+
+        poll = get_poll(poll_id)
+
+        if not poll or poll["status"] != "active":
+            await update.message.reply_text(
+                "Bu opros mavjud emas yoki yopilgan."
+            )
+            return
+
+        context.user_data["current_poll_id"] = poll_id
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "📢 Kanalga a'zo bo'lish",
+                url="https://t.me/Karmana_yoshlaruz"
+            )],
+            [InlineKeyboardButton(
+                "✅ A'zolikni tekshirish",
+                callback_data=f"check_poll_{poll_id}"
+            )]
+        ]
+
+        await update.message.reply_text(
+            f"📊 {poll['title']}\n\n"
+            f"❓ {poll['question']}\n\n"
+            "Ovoz berishda qatnashish uchun kanalga a'zo bo'ling.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
     keyboard = [
         [InlineKeyboardButton(
             "📢 Kanalga a'zo bo'lish",
@@ -123,8 +230,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "kanalimizga a'zo bo'ling.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
-
 
 async def show_poll(query, page=0):
     options = get_options()
@@ -173,6 +278,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -184,9 +290,95 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    # 1. YANGI OPROS NOMI
+    if action == "poll_title":
+        if not text:
+            await update.message.reply_text("Opros nomi bo'sh bo'lmasin.")
+            return
+
+        context.user_data["new_poll"]["title"] = text
+        context.user_data["admin_action"] = "poll_question"
+
+        await update.message.reply_text(
+            "❓ Endi opros savolini yuboring:"
+        )
+        return
+
+    # 2. YANGI OPROS SAVOLI
+    if action == "poll_question":
+        if not text:
+            await update.message.reply_text("Savol bo'sh bo'lmasin.")
+            return
+
+        context.user_data["new_poll"]["question"] = text
+        context.user_data["admin_action"] = "poll_options"
+
+        await update.message.reply_text(
+            "📝 Endi javob variantlarini yuboring.\n\n"
+            "Har bir variantni alohida qatorda yozing.\n\n"
+            "Masalan:\n"
+            "1-mahalla\n"
+            "2-mahalla\n"
+            "3-mahalla"
+        )
+        return
+
+    # 3. YANGI OPROS JAVOB VARIANTLARI
+    if action == "poll_options":
+        options = [
+            item.strip()
+            for item in text.splitlines()
+            if item.strip()
+        ]
+
+        if len(options) < 2:
+            await update.message.reply_text(
+                "Kamida 2 ta javob varianti kiriting."
+            )
+            return
+
+        if len(options) > 50:
+            await update.message.reply_text(
+                "Eng ko'pi bilan 50 ta variant kiritish mumkin."
+            )
+            return
+
+        if len(set(options)) != len(options):
+            await update.message.reply_text(
+                "Bir xil javob variantlarini takrorlamang."
+            )
+            return
+
+        poll_data = context.user_data["new_poll"]
+
+        poll_id = create_poll(
+            poll_data["title"],
+            poll_data["question"],
+            options
+        )
+
+        context.user_data.pop("new_poll", None)
+        context.user_data.pop("admin_action", None)
+
+        bot_username = context.bot.username
+        link = f"https://t.me/{bot_username}?start=poll_{poll_id}"
+
+        await update.message.reply_text(
+            f"✅ YANGI OPROS YARATILDI!\n\n"
+            f"📌 Nomi: {poll_data['title']}\n"
+            f"❓ Savol: {poll_data['question']}\n"
+            f"📝 Variantlar soni: {len(options)} ta\n\n"
+            f"🔗 Opros havolasi:\n{link}",
+            reply_markup=admin_keyboard()
+        )
+        return
+
+    # ESKI SAVOLNI O'ZGARTIRISH
     if action == "question":
         if not text:
-            await update.message.reply_text("Savol bo'sh bo'lmasligi kerak.")
+            await update.message.reply_text(
+                "Savol bo'sh bo'lmasligi kerak."
+            )
             return
 
         save_setting("question", text)
@@ -194,33 +386,49 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("admin_action", None)
 
         await update.message.reply_text(
-            "✅ Yangi savol saqlandi!",
+            "✅ Eski savol yangilandi!",
             reply_markup=admin_keyboard()
         )
+        return
 
-    elif action == "options":
-        options = [item.strip() for item in text.splitlines() if item.strip()]
+    # ESKI JAVOBLARNI O'ZGARTIRISH
+    if action == "options":
+        options = [
+            item.strip()
+            for item in text.splitlines()
+            if item.strip()
+        ]
 
         if len(options) < 2:
-            await update.message.reply_text("Kamida 2 ta javob varianti kiriting.")
+            await update.message.reply_text(
+                "Kamida 2 ta javob varianti kiriting."
+            )
             return
 
         if len(options) > 50:
-            await update.message.reply_text("Eng ko'pi bilan 50 ta variant kiritish mumkin.")
+            await update.message.reply_text(
+                "Eng ko'pi bilan 50 ta variant kiriting."
+            )
             return
 
         if len(set(options)) != len(options):
-            await update.message.reply_text("Bir xil javob variantlarini takrorlamang.")
+            await update.message.reply_text(
+                "Bir xil javob variantlarini takrorlamang."
+            )
             return
 
-        save_setting("options", json.dumps(options, ensure_ascii=False))
+        save_setting(
+            "options",
+            json.dumps(options, ensure_ascii=False)
+        )
         reset_votes()
         context.user_data.pop("admin_action", None)
 
         await update.message.reply_text(
-            "✅ Javob variantlari saqlandi!",
+            "✅ Eski javob variantlari yangilandi!",
             reply_markup=admin_keyboard()
         )
+        return
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -236,6 +444,25 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin_"):
         if not is_admin(user_id):
             await query.answer("Ruxsat yo'q!", show_alert=True)
+            return
+
+        # YANGI OPROS YARATISH
+        if data == "admin_new_poll":
+            await new_poll_start(query, context)
+            return
+
+        # BARCHA OPROSLAR
+        if data == "admin_all_polls":
+            await show_all_polls(query)
+            return
+
+        # ALOHIDA OPROSNI KO'RISH
+        if data.startswith("admin_view_poll_"):
+            try:
+                poll_id = int(data.replace("admin_view_poll_", ""))
+                await show_poll_details(query, poll_id, context)
+            except ValueError:
+                await query.edit_message_text("Opros ID noto'g'ri.")
             return
 
         if data == "admin_question":
