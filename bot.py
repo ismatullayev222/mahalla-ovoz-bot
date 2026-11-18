@@ -141,11 +141,17 @@ async def results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Sizning Telegram ID raqamingiz: {update.effective_user.id}"
+    )
+
 async def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("natija", results))
     app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(CommandHandler("myid", myid))
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
