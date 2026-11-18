@@ -4,7 +4,16 @@ import json
 import sqlite3
 import asyncio
 
-from database import init_db, create_poll, get_all_polls, get_poll
+from database import (
+    init_db,
+    create_poll,
+    get_all_polls,
+    get_poll,
+    cast_vote,
+    get_results,
+    close_poll,
+    delete_poll
+)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -524,6 +533,49 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("admin_action", None)
             await query.edit_message_text("❌ Amal bekor qilindi.")
             return
+
+    # YANGI OPROS UCHUN OBUNANI TEKSHIRISH
+    if data.startswith("check_poll_"):
+        try:
+            poll_id = int(data.replace("check_poll_", ""))
+        except ValueError:
+            await query.answer("Opros ID noto'g'ri.", show_alert=True)
+            return
+
+        poll = get_poll(poll_id)
+
+        if not poll or poll["status"] != "active":
+            await query.answer(
+                "Bu opros yopilgan yoki mavjud emas.",
+                show_alert=True
+            )
+            return
+
+               if await is_subscriber(context.bot, user_id):
+            await query.answer("A'zolik tasdiqlandi!")
+
+            keyboard = []
+
+            for i, option in enumerate(poll["options"]):
+                keyboard.append([
+                    InlineKeyboardButton(
+                        option,
+                        callback_data=f"new_vote_{poll_id}_{i}"
+                    )
+                ])
+
+            await query.edit_message_text(
+                f"📊 {poll['title']}\n\n"
+                f"❓ {poll['question']}\n\n"
+                "O'zingizga ma'qul javobni tanlang:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.answer(
+                "Avval kanalga a'zo bo'ling!",
+                show_alert=True
+            )
+        return
 
     # OBUNANI TEKSHIRISH
     if data == "check":
