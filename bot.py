@@ -14,7 +14,10 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.environ["BOT_TOKEN"]
+TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi! Railway Variables sozlamasini tekshiring.")
 CHANNEL = "@Karmana_yoshlaruz"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
