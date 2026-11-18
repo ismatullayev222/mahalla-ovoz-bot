@@ -155,8 +155,10 @@ async def show_poll_details(query, poll_id, context):
 
     link = f"https://t.me/{bot_username}?start=poll_{poll_id}"
 
+    
     keyboard = [
         [InlineKeyboardButton("🔗 Opros havolasini ochish", url=link)],
+        [InlineKeyboardButton("📊 Natijalarni ko'rish", callback_data=f"admin_poll_results_{poll_id}")],
         [InlineKeyboardButton("⬅️ Barcha oproslar", callback_data="admin_all_polls")]
     ]
 
@@ -474,6 +476,48 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Opros ID noto'g'ri.")
             return
 
+        # YANGI OPROS NATIJALARI
+        if data.startswith("admin_poll_results_"):
+            try:
+                poll_id = int(data.replace("admin_poll_results_", ""))
+            except ValueError:
+                await query.answer("Opros ID noto'g'ri.", show_alert=True)
+                return
+
+            poll = get_poll(poll_id)
+
+            if not poll:
+                await query.answer("Opros topilmadi.", show_alert=True)
+                return
+
+            results_data = get_results(poll_id)
+            total = sum(row["votes"] for row in results_data)
+
+            message = (
+                f"📊 {poll['title']}\n\n"
+                f"Jami ovozlar: {total}\n\n"
+            )
+
+            for row in results_data:
+                count = row["votes"]
+                percent = (count / total * 100) if total else 0
+
+                message += (
+                    f"▪️ {row['option_text']}\n"
+                    f"   {count} ta ({percent:.1f}%)\n\n"
+                )
+
+            await query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "⬅️ Oprosga qaytish",
+                        callback_data=f"admin_view_poll_{poll_id}"
+                    )]
+                ])
+            )
+            return
+
         if data == "admin_question":
             context.user_data["admin_action"] = "question"
             await query.edit_message_text(
@@ -584,6 +628,49 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer(
                 "Siz hali kanalga a'zo emassiz!",
+                show_alert=True
+            )
+        return
+
+    # YANGI OPROS UCHUN OVOZ BERISH
+    if data.startswith("new_vote_"):
+        if not await is_subscriber(context.bot, user_id):
+            await query.answer(
+                "Ovoz berish uchun kanalga a'zo bo'ling!",
+                show_alert=True
+            )
+            return
+
+        try:
+            parts = data.split("_")
+            poll_id = int(parts[2])
+            option_id = int(parts[3])
+        except (ValueError, IndexError):
+            await query.answer(
+                "Ovoz berish ma'lumoti noto'g'ri.",
+                show_alert=True
+            )
+            return
+
+        result = cast_vote(poll_id, user_id, option_id)
+
+        if result == "success":
+            await query.edit_message_text(
+                "✅ Ovozingiz muvaffaqiyatli qabul qilindi!"
+            )
+        elif result == "already_voted":
+            await query.answer(
+                "Siz bu oprosda avval ovoz bergansiz!",
+                show_alert=True
+            )
+        elif result == "closed":
+            await query.answer(
+                "Bu opros yopilgan!",
+                show_alert=True
+            )
+        else:
+            await query.answer(
+                "Javob varianti topilmadi!",
                 show_alert=True
             )
         return
