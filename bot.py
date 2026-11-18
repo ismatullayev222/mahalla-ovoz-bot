@@ -170,6 +170,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
 async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -188,12 +189,10 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save_setting("question", text)
         reset_votes()
-
         context.user_data.pop("admin_action", None)
 
         await update.message.reply_text(
-            "✅ Yangi savol saqlandi!\n"
-            "Eski ovozlar yangi so'rovnoma uchun tozalandi.",
+            "✅ Yangi savol saqlandi!",
             reply_markup=admin_keyboard()
         )
 
@@ -201,19 +200,12 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         options = [item.strip() for item in text.splitlines() if item.strip()]
 
         if len(options) < 2:
-            await update.message.reply_text(
-                "Kamida 2 ta javob varianti kiriting.\n"
-                "Har bir variantni yangi qatordan yozing."
-            )
+            await update.message.reply_text("Kamida 2 ta javob varianti kiriting.")
             return
 
-        
         if len(options) > 50:
-            await update.message.reply_text(
-                "Eng ko'pi bilan 50 ta variant kiritish mumkin."
-            )
+            await update.message.reply_text("Eng ko'pi bilan 50 ta variant kiritish mumkin.")
             return
-
 
         if len(set(options)) != len(options):
             await update.message.reply_text("Bir xil javob variantlarini takrorlamang.")
@@ -221,15 +213,12 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save_setting("options", json.dumps(options, ensure_ascii=False))
         reset_votes()
-
         context.user_data.pop("admin_action", None)
 
         await update.message.reply_text(
-            "✅ Javob variantlari saqlandi!\n"
-            "Eski ovozlar yangi so'rovnoma uchun tozalandi.",
+            "✅ Javob variantlari saqlandi!",
             reply_markup=admin_keyboard()
         )
-
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
