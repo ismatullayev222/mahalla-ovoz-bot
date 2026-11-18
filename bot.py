@@ -620,7 +620,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-               if await is_subscriber(context.bot, user_id):
+               
+        if await is_subscriber(context.bot, user_id):
             await query.answer("A'zolik tasdiqlandi!")
 
             keyboard = []
