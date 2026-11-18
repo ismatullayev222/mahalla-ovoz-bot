@@ -123,16 +123,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def show_poll(query):
+
+async def show_poll(query, page=0):
     options = get_options()
+    per_page = 10
+    start = page * per_page
+    end = start + per_page
 
     keyboard = [
         [InlineKeyboardButton(option, callback_data=f"vote_{i}")]
-        for i, option in enumerate(options)
+        for i, option in enumerate(options[start:end], start=start)
     ]
 
+    navigation = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton("⬅️ Oldingi", callback_data=f"poll_page_{page-1}")
+        )
+
+    if end < len(options):
+        navigation.append(
+            InlineKeyboardButton("Keyingi ➡️", callback_data=f"poll_page_{page+1}")
+        )
+
+    if navigation:
+        keyboard.append(navigation)
+
     await query.edit_message_text(
-        get_question(),
+        get_question() + f"\n\n📄 Sahifa: {page+1}/{(len(options)+9)//10}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -188,9 +207,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if len(options) > 10:
-            await update.message.reply_text("Eng ko'pi bilan 10 ta variant kiritish mumkin.")
-            return
+        if len(options) > 50:
+    await update.message.reply_text(
+        "Eng ko'pi bilan 50 ta variant kiritish mumkin."
+    )
+    return
 
         if len(set(options)) != len(options):
             await update.message.reply_text("Bir xil javob variantlarini takrorlamang.")
@@ -214,7 +235,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = query.from_user.id
     data = query.data
-
+    if data.startswith("poll_page_"):
+        page = int(data.split("_")[2])
+        await show_poll(query, page)
+        return
     # ADMIN PANEL
     if data.startswith("admin_"):
         if not is_admin(user_id):
