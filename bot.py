@@ -156,11 +156,18 @@ async def show_poll_details(query, poll_id, context):
     link = f"https://t.me/{bot_username}?start=poll_{poll_id}"
 
     
+    
     keyboard = [
         [InlineKeyboardButton("🔗 Opros havolasini ochish", url=link)],
         [InlineKeyboardButton("📊 Natijalarni ko'rish", callback_data=f"admin_poll_results_{poll_id}")],
+        [InlineKeyboardButton(
+            "🔒 Oprosni yopish",
+            callback_data=f"admin_close_poll_{poll_id}"
+        )] if poll["status"] == "active" else [],
         [InlineKeyboardButton("⬅️ Barcha oproslar", callback_data="admin_all_polls")]
     ]
+    keyboard = [row for row in keyboard if row]
+
 
     await query.edit_message_text(
         f"📊 {poll['title']}\n\n"
@@ -516,6 +523,24 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )]
                 ])
             )
+            return
+
+        # OPROSNI YOPISH
+        if data.startswith("admin_close_poll_"):
+            try:
+                poll_id = int(data.replace("admin_close_poll_", ""))
+            except ValueError:
+                await query.answer("Opros ID noto'g'ri.", show_alert=True)
+                return
+
+            success = close_poll(poll_id)
+
+            if success:
+                await query.answer("Opros muvaffaqiyatli yopildi!")
+                await show_poll_details(query, poll_id, context)
+            else:
+                await query.answer("Opros topilmadi.", show_alert=True)
+
             return
 
         if data == "admin_question":
