@@ -207,11 +207,13 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        
         if len(options) > 50:
-    await update.message.reply_text(
-        "Eng ko'pi bilan 50 ta variant kiritish mumkin."
-    )
-    return
+            await update.message.reply_text(
+                "Eng ko'pi bilan 50 ta variant kiritish mumkin."
+            )
+            return
+
 
         if len(set(options)) != len(options):
             await update.message.reply_text("Bir xil javob variantlarini takrorlamang.")
