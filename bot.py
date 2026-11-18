@@ -556,11 +556,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             keyboard = []
 
-            for i, option in enumerate(poll["options"]):
+            for option in poll["options"]:
                 keyboard.append([
                     InlineKeyboardButton(
-                        option,
-                        callback_data=f"new_vote_{poll_id}_{i}"
+                        option["option_text"],
+                        callback_data=f"new_vote_{poll_id}_{option['id']}"
                     )
                 ])
 
