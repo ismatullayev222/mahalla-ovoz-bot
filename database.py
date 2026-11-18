@@ -1,30 +1,59 @@
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
+
 
 DB_PATH = os.getenv("DB_PATH", "votes.db")
 
 
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+@contextmanager
 def get_db():
     folder = os.path.dirname(DB_PATH)
+
     if folder:
         os.makedirs(folder, exist_ok=True)
 
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        isolation_level="DEFERRED"
+    )
+
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
+
+        yield conn
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 
 def init_db():
     with get_db() as conn:
+
+        # Eski votes jadvaliga tegilmaydi.
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS polls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 question TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'closed')),
                 created_at TEXT NOT NULL
             )
         """)
@@ -34,7 +63,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 poll_id INTEGER NOT NULL,
                 option_text TEXT NOT NULL,
-                FOREIGN KEY (poll_id) REFERENCES polls(id)
+                FOREIGN KEY (poll_id)
+                    REFERENCES polls(id)
                     ON DELETE CASCADE,
                 UNIQUE(poll_id, option_text)
             )
@@ -47,9 +77,14 @@ def init_db():
                 user_id INTEGER NOT NULL,
                 option_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY (poll_id) REFERENCES polls(id)
+
+                FOREIGN KEY (poll_id)
+                    REFERENCES polls(id)
                     ON DELETE CASCADE,
-                FOREIGN KEY (option_id) REFERENCES options(id),
+
+                FOREIGN KEY (option_id)
+                    REFERENCES options(id),
+
                 UNIQUE(poll_id, user_id)
             )
         """)
@@ -61,31 +96,57 @@ def init_db():
 
 
 def create_poll(title, question, options):
+    title = title.strip()
+    question = question.strip()
+
+    options = [
+        item.strip()
+        for item in options
+        if item.strip()
+    ]
+
+    if not title or not question:
+        raise ValueError("Opros nomi va savoli bo'sh bo'lmasligi kerak.")
+
+    if len(options) < 2:
+        raise ValueError("Kamida 2 ta javob varianti kerak.")
+
+    if len(options) > 50:
+        raise ValueError("Eng ko'pi bilan 50 ta variant mumkin.")
+
+    if len(set(options)) != len(options):
+        raise ValueError("Takroriy javob variantlari mavjud.")
+
     with get_db() as conn:
+
         cursor = conn.execute(
-            """INSERT INTO polls (title, question, status, created_at)
-               VALUES (?, ?, 'active', ?)""",
-            (
-                title,
-                question,
-                datetime.now(timezone.utc).isoformat()
-            )
+            """
+            INSERT INTO polls
+                (title, question, status, created_at)
+            VALUES (?, ?, 'active', ?)
+            """,
+            (title, question, now_utc())
         )
 
         poll_id = cursor.lastrowid
 
-        for option in options:
-            conn.execute(
-                """INSERT INTO options (poll_id, option_text)
-                   VALUES (?, ?)""",
+        conn.executemany(
+            """
+            INSERT INTO options (poll_id, option_text)
+            VALUES (?, ?)
+            """,
+            [
                 (poll_id, option)
-            )
+                for option in options
+            ]
+        )
 
         return poll_id
 
 
 def get_poll(poll_id):
     with get_db() as conn:
+
         poll = conn.execute(
             "SELECT * FROM polls WHERE id = ?",
             (poll_id,)
@@ -95,8 +156,12 @@ def get_poll(poll_id):
             return None
 
         options = conn.execute(
-            """SELECT id, option_text FROM options
-               WHERE poll_id = ? ORDER BY id""",
+            """
+            SELECT id, option_text
+            FROM options
+            WHERE poll_id = ?
+            ORDER BY id
+            """,
             (poll_id,)
         ).fetchall()
 
@@ -105,56 +170,94 @@ def get_poll(poll_id):
             "title": poll["title"],
             "question": poll["question"],
             "status": poll["status"],
-            "options": [dict(item) for item in options]
+            "created_at": poll["created_at"],
+            "options": [
+                dict(option)
+                for option in options
+            ]
         }
 
 
 def get_all_polls():
     with get_db() as conn:
-        return conn.execute(
-            "SELECT * FROM polls ORDER BY id DESC"
+
+        rows = conn.execute(
+            """
+            SELECT
+                p.id,
+                p.title,
+                p.question,
+                p.status,
+                p.created_at,
+                COUNT(DISTINCT v.id) AS total_votes
+            FROM polls p
+            LEFT JOIN poll_votes v
+                ON v.poll_id = p.id
+            GROUP BY p.id
+            ORDER BY p.id DESC
+            """
         ).fetchall()
+
+        return [
+            dict(row)
+            for row in rows
+        ]
 
 
 def cast_vote(poll_id, user_id, option_id):
     with get_db() as conn:
-        poll = conn.execute(
-            "SELECT status FROM polls WHERE id = ?",
-            (poll_id,)
-        ).fetchone()
-
-        if not poll or poll["status"] != "active":
-            return "closed"
-
-        option = conn.execute(
-            """SELECT id FROM options
-               WHERE id = ? AND poll_id = ?""",
-            (option_id, poll_id)
-        ).fetchone()
-
-        if not option:
-            return "invalid"
 
         try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            poll = conn.execute(
+                """
+                SELECT status
+                FROM polls
+                WHERE id = ?
+                """,
+                (poll_id,)
+            ).fetchone()
+
+            if not poll or poll["status"] != "active":
+                return "closed"
+
+            option = conn.execute(
+                """
+                SELECT id
+                FROM options
+                WHERE id = ? AND poll_id = ?
+                """,
+                (option_id, poll_id)
+            ).fetchone()
+
+            if not option:
+                return "invalid"
+
             conn.execute(
-                """INSERT INTO poll_votes
-                   (poll_id, user_id, option_id, created_at)
-                   VALUES (?, ?, ?, ?)""",
+                """
+                INSERT INTO poll_votes
+                    (poll_id, user_id, option_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
                 (
                     poll_id,
                     user_id,
                     option_id,
-                    datetime.now(timezone.utc).isoformat()
+                    now_utc()
                 )
             )
+
             return "success"
+
         except sqlite3.IntegrityError:
             return "already_voted"
 
 
 def get_results(poll_id):
     with get_db() as conn:
-        return conn.execute(
+
+        rows = conn.execute(
             """
             SELECT
                 o.id,
@@ -171,20 +274,28 @@ def get_results(poll_id):
             (poll_id,)
         ).fetchall()
 
+        return [
+            dict(row)
+            for row in rows
+        ]
+
 
 def close_poll(poll_id):
     with get_db() as conn:
+
         cursor = conn.execute(
-            "UPDATE polls SET status = 'closed' WHERE id = ?",
+            """
+            UPDATE polls
+            SET status = 'closed'
+            WHERE id = ? AND status = 'active'
+            """,
             (poll_id,)
         )
+
         return cursor.rowcount > 0
 
 
 def delete_poll(poll_id):
-    with get_db() as conn:
-        cursor = conn.execute(
-            "DELETE FROM polls WHERE id = ?",
-            (poll_id,)
-        )
-        return cursor.rowcount > 0
+    # Tarixiy ma'lumotlarni himoya qilish uchun
+    # oproslarni o'chirish taqiqlangan.
+    return False
