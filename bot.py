@@ -1,10 +1,20 @@
 import json
 import logging
 import os
+import re
 import sqlite3
+from datetime import datetime
 from math import ceil
+from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -15,13 +25,15 @@ from telegram.ext import (
 )
 
 from database import (
-    init_db,
+    cast_vote,
+    close_poll,
     create_poll,
     get_all_polls,
     get_poll,
-    cast_vote,
     get_results,
-    close_poll,
+    get_user_phone,
+    init_db,
+    save_user_phone,
 )
 
 
@@ -36,12 +48,21 @@ try:
 except ValueError:
     ADMIN_ID = 0
 
-CHANNEL = os.getenv("CHANNEL", "@Karmana_yoshlaruz").strip()
-CHANNEL_LINK = os.getenv(
-    "CHANNEL_LINK",
-    "https://t.me/Karmana_yoshlaruz",
+
+def _parse_csv_list(raw_value):
+    return [item.strip() for item in (raw_value or "").split(",") if item.strip()]
+
+
+SINGLE_CHANNEL = (os.getenv("CHANNEL") or "@Karmana_yoshlaruz").strip()
+SINGLE_CHANNEL_LINK = (
+    os.getenv("CHANNEL_LINK") or "https://t.me/Karmana_yoshlaruz"
 ).strip()
+
+CHANNELS = _parse_csv_list(os.getenv("CHANNELS")) or ([SINGLE_CHANNEL] if SINGLE_CHANNEL else [])
+CHANNEL_LINKS = _parse_csv_list(os.getenv("CHANNEL_LINKS"))
+
 DB_PATH = os.getenv("DB_PATH", "votes.db")
+TZ_NAME = (os.getenv("BOT_TIMEZONE") or "Asia/Tashkent").strip()
 
 DEFAULT_QUESTION = (
     "Sizningcha, Karmana tumanidagi eng faol mahalla yettiligi?"
@@ -52,11 +73,162 @@ POLL_LIST_PAGE_SIZE = 10
 OLD_POLL_PAGE_SIZE = 8
 TELEGRAM_MESSAGE_LIMIT = 3500
 
+BTN_VOTE = "Ovoz berish"
+BTN_PHONE = "📱 Telefon raqamni tasdiqlash"
+BTN_CONFIRM_VOTE = "Ovoz berishni tasdiqlash"
+BTN_CANCEL_VOTE = "Bekor qilish"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def _get_timezone():
+    try:
+        return ZoneInfo(TZ_NAME)
+    except Exception:
+        return ZoneInfo("Asia/Tashkent")
+
+
+def _normalize_channel_chat_id(channel):
+    value = str(channel).strip()
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if value.startswith("https://t.me/"):
+        username = value.removeprefix("https://t.me/").strip("/").split("/")[0]
+        if username:
+            return f"@{username}"
+    return value
+
+
+def _build_channel_targets():
+    targets = []
+    for idx, ch in enumerate(CHANNELS):
+        chat_id = _normalize_channel_chat_id(ch)
+        if idx < len(CHANNEL_LINKS) and CHANNEL_LINKS[idx]:
+            url = CHANNEL_LINKS[idx]
+        elif str(ch).startswith("http"):
+            url = str(ch).strip()
+        elif str(ch).startswith("@"):
+            url = f"https://t.me/{str(ch).lstrip('@')}"
+        elif SINGLE_CHANNEL and ch == SINGLE_CHANNEL and SINGLE_CHANNEL_LINK:
+            url = SINGLE_CHANNEL_LINK
+        else:
+            url = None
+        targets.append((chat_id, url))
+    return targets
+
+
+CHANNEL_TARGETS = _build_channel_targets()
+
+
+# =========================================================
+# VAQT VA SO'ROVNOMA HOLATI YORDAMCHILARI
+# =========================================================
+
+def parse_deadline(ends_at_str):
+    """Parse 'DD.MM.YYYY HH:MM' or ISO datetime into a timezone-aware datetime."""
+    if not ends_at_str:
+        return None
+    raw = str(ends_at_str).strip()
+    if not raw or raw == "-":
+        return None
+
+    tz = _get_timezone()
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=tz)
+        except ValueError:
+            continue
+
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+    except ValueError:
+        return None
+
+
+def is_poll_expired(poll):
+    if not poll:
+        return True
+    if poll.get("status") != "active":
+        return True
+    deadline = parse_deadline(poll.get("ends_at"))
+    if deadline is not None:
+        now_local = datetime.now(_get_timezone())
+        if now_local >= deadline:
+            return True
+    return False
+
+
+def format_expired_message(poll):
+    ends_text = (poll.get("ends_at") or "").strip()
+    if ends_text and ends_text != "-":
+        return (
+            "Ushbu so'rovnoma o'z yakuniga yetgan.\n"
+            f"Tugash vaqti: {ends_text}"
+        )
+    return "Ushbu so'rovnoma o'z yakuniga yetgan."
+
+
+# =========================================================
+# KLAVIATURALAR
+# =========================================================
+
+def phone_request_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_PHONE, request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def main_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_VOTE)]],
+        resize_keyboard=True,
+    )
+
+
+def confirm_vote_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_CONFIRM_VOTE)],
+            [KeyboardButton(BTN_CANCEL_VOTE)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def multi_channel_keyboard(check_callback_data):
+    rows = []
+    idx = 1
+    for _, url in CHANNEL_TARGETS:
+        if url:
+            rows.append([InlineKeyboardButton(f"{idx} - Kanalga a'zo bo'lish", url=url)])
+            idx += 1
+
+    if not rows and SINGLE_CHANNEL_LINK:
+        rows.append([InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=SINGLE_CHANNEL_LINK)])
+
+    rows.append([InlineKeyboardButton("✅ Obuna bo'ldim", callback_data=check_callback_data)])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Yangi opros yaratish", callback_data="admin_new_poll")],
+        [InlineKeyboardButton("📋 Barcha oproslar", callback_data="admin_all_polls")],
+        [InlineKeyboardButton("✏️ Eski savolni o'zgartirish", callback_data="admin_question")],
+        [InlineKeyboardButton("📝 Eski javoblarni o'zgartirish", callback_data="admin_options")],
+        [InlineKeyboardButton("📊 Eski natijalarni ko'rish", callback_data="admin_results")],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_cancel")],
+    ])
 
 
 # =========================================================
@@ -77,7 +249,6 @@ def legacy_db():
 def init_legacy_db():
     conn = legacy_db()
     try:
-        # IF NOT EXISTS mavjud jadval yoki uning yozuvlarini o'zgartirmaydi.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS votes (
                 user_id INTEGER PRIMARY KEY,
@@ -157,17 +328,6 @@ def is_admin(user_id):
     return bool(ADMIN_ID) and user_id == ADMIN_ID
 
 
-def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Yangi opros yaratish", callback_data="admin_new_poll")],
-        [InlineKeyboardButton("📋 Barcha oproslar", callback_data="admin_all_polls")],
-        [InlineKeyboardButton("✏️ Eski savolni o'zgartirish", callback_data="admin_question")],
-        [InlineKeyboardButton("📝 Eski javoblarni o'zgartirish", callback_data="admin_options")],
-        [InlineKeyboardButton("📊 Eski natijalarni ko'rish", callback_data="admin_results")],
-        [InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_cancel")],
-    ])
-
-
 # =========================================================
 # UMUMIY YORDAMCHI FUNKSIYALAR
 # =========================================================
@@ -188,7 +348,6 @@ def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
             chunks.append(current)
             current = ""
 
-        # A single line can itself be longer than the limit.
         while len(line) > limit:
             chunks.append(line[:limit])
             line = line[limit:]
@@ -223,6 +382,206 @@ async def send_result_chunks_from_query(query, context, text, reply_markup=None)
     if chat_id is not None:
         for chunk in chunks[1:]:
             await context.bot.send_message(chat_id=chat_id, text=chunk)
+
+
+# =========================================================
+# KANALGA A'ZOLIKNI TEKSHIRISH
+# =========================================================
+
+async def _check_single_channel(bot, chat_id, user_id):
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return (
+            member.status in ("creator", "administrator", "member")
+            or (
+                member.status == "restricted"
+                and bool(getattr(member, "is_member", False))
+            )
+        )
+    except Exception:
+        logger.exception(
+            "Kanal a'zoligini tekshirishda xatolik (%s). "
+            "Bot kanalga administrator sifatida qo'shilganini tekshiring.",
+            chat_id,
+        )
+        return False
+
+
+async def is_subscriber(bot, user_id):
+    if not CHANNEL_TARGETS:
+        return True
+    for chat_id, _ in CHANNEL_TARGETS:
+        ok = await _check_single_channel(bot, chat_id, user_id)
+        if not ok:
+            return False
+    return True
+
+
+def subscription_prompt_text():
+    count = len(CHANNEL_TARGETS)
+    if count > 1:
+        return (
+            f"❗ Iltimos, so'rovnomada ishtirok etish uchun quyidagi {count} ta "
+            "kanalga a'zo bo'ling."
+        )
+    return "Ovoz berishda qatnashish uchun avval kanalimizga a'zo bo'ling."
+
+
+# =========================================================
+# TELEFON RAQAMNI TASDIQLASH VA ASOSIY MENYU
+# =========================================================
+
+async def prompt_phone_verification(message):
+    await message.reply_text(
+        "Hurmatli foydalanuvchi! So'rovnomalarda qatnashish uchun "
+        "telefon raqamingizni tasdiqlang.",
+        reply_markup=phone_request_keyboard(),
+    )
+
+
+async def send_welcome_menu(message):
+    await message.reply_text(
+        "Assalomu Alaykum.\nSo'rovnoma botga hush kelibsiz!",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.contact or not update.effective_user:
+        return
+
+    contact = update.message.contact
+    user_id = update.effective_user.id
+
+    if contact.user_id and contact.user_id != user_id:
+        await update.message.reply_text(
+            "Iltimos, faqat o'zingizning telefon raqamingizni yuboring.",
+            reply_markup=phone_request_keyboard(),
+        )
+        return
+
+    phone = (contact.phone_number or "").strip()
+    if not phone:
+        await update.message.reply_text(
+            "Telefon raqami aniqlanmadi. Qayta urinib ko'ring.",
+            reply_markup=phone_request_keyboard(),
+        )
+        return
+
+    if not phone.startswith("+"):
+        phone = f"+{phone}"
+
+    save_user_phone(user_id, phone)
+
+    await update.message.reply_text(
+        "Rahmat, telefon raqamingiz muvaffaqiyatli tasdiqlandi!",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await send_welcome_menu(update.message)
+
+    pending_poll_id = context.user_data.pop("pending_poll_id", None)
+    if pending_poll_id:
+        poll = get_poll(pending_poll_id)
+        if not poll:
+            await update.message.reply_text(
+                "Bu opros topilmadi.",
+                reply_markup=main_menu_keyboard(),
+            )
+        elif is_poll_expired(poll):
+            await update.message.reply_text(
+                format_expired_message(poll),
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            await open_poll_for_user(
+                update.message,
+                context,
+                user_id,
+                poll,
+                from_callback_query=None,
+            )
+
+
+async def show_active_polls_menu(message):
+    polls = [p for p in get_all_polls() if not is_poll_expired(p)]
+    if not polls:
+        await message.reply_text(
+            "Hozircha faol so'rovnomalar mavjud emas.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    rows = []
+    for poll in polls[:20]:
+        title = str(poll["title"])[:60]
+        rows.append([InlineKeyboardButton(title, callback_data=f"open_poll_{poll['id']}")])
+
+    await message.reply_text(
+        "Quyidagi ko'rsatilgan so'rovnomalardan birini tanlang 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def open_poll_for_user(target_message, context, user_id, poll, from_callback_query=None):
+    if is_poll_expired(poll):
+        msg = format_expired_message(poll)
+        if from_callback_query:
+            await from_callback_query.edit_message_text(msg)
+        else:
+            await target_message.reply_text(msg, reply_markup=main_menu_keyboard())
+        return
+
+    if not await is_subscriber(context.bot, user_id):
+        markup = multi_channel_keyboard(f"check_poll_{poll['id']}")
+        text = subscription_prompt_text()
+        if from_callback_query:
+            await from_callback_query.edit_message_text(text, reply_markup=markup)
+        else:
+            await target_message.reply_text(text, reply_markup=markup)
+        return
+
+    context.user_data["active_poll_id"] = poll["id"]
+    context.user_data.pop("pending_vote", None)
+
+    option_rows = [
+        [KeyboardButton(opt["option_text"])]
+        for opt in poll["options"]
+    ]
+    option_rows.append([KeyboardButton(BTN_VOTE)])
+
+    caption_lines = [f"📊 {poll['title']}"]
+    if poll.get("question"):
+        caption_lines.extend(["", f"❓ {poll['question']}"])
+    ends_text = (poll.get("ends_at") or "").strip()
+    if ends_text and ends_text != "-":
+        caption_lines.extend(["", f"⏰ Tugash vaqti: {ends_text}"])
+    caption_lines.extend(["", "Quyidagi tugmalardan birini tanlang 👇"])
+    caption = "\n".join(caption_lines)
+
+    chat_id = target_message.chat_id if target_message else None
+    photo_id = (poll.get("photo_file_id") or "").strip()
+
+    if photo_id and chat_id is not None:
+        if from_callback_query:
+            try:
+                await from_callback_query.delete_message()
+            except Exception:
+                pass
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo_id,
+            caption=caption[:1024],
+            reply_markup=ReplyKeyboardMarkup(option_rows, resize_keyboard=True),
+        )
+    else:
+        if from_callback_query:
+            await from_callback_query.edit_message_text(caption)
+        if chat_id is not None:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                reply_markup=ReplyKeyboardMarkup(option_rows, resize_keyboard=True),
+            )
 
 
 # =========================================================
@@ -273,7 +632,8 @@ async def show_all_polls(query, page=0):
 
     keyboard = []
     for poll in page_polls:
-        status_icon = "🟢" if poll["status"] == "active" else "🔴"
+        is_closed = is_poll_expired(poll)
+        status_icon = "🔴" if is_closed else "🟢"
         title = str(poll["title"])[:55]
         keyboard.append([InlineKeyboardButton(
             f"{status_icon} {title} · {poll['total_votes']} ovoz",
@@ -312,7 +672,11 @@ async def show_poll_details(query, poll_id, context):
     bot_info = await context.bot.get_me()
     link = f"https://t.me/{bot_info.username}?start=poll_{poll_id}"
 
-    status_text = "Faol" if poll["status"] == "active" else "Yopilgan"
+    is_closed = is_poll_expired(poll)
+    status_text = "Yopilgan / Yakunlangan" if is_closed else "Faol"
+    ends_line = f"Tugash vaqti: {poll['ends_at']}\n" if poll.get("ends_at") else ""
+    photo_line = "Rasm: Biriktirilgan\n" if poll.get("photo_file_id") else ""
+
     keyboard = [
         [InlineKeyboardButton("🔗 Opros havolasi", url=link)],
         [InlineKeyboardButton(
@@ -335,6 +699,8 @@ async def show_poll_details(query, poll_id, context):
         f"📊 {poll['title']}\n\n"
         f"❓ {poll['question']}\n\n"
         f"Holati: {status_text}\n"
+        f"{ends_line}"
+        f"{photo_line}"
         f"Yaratilgan vaqti (UTC): {poll['created_at']}\n\n"
         f"🔗 Havola:\n{link}",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -349,10 +715,11 @@ async def show_new_results(query, poll_id, context):
 
     rows = get_results(poll_id)
     total = sum(int(row["votes"]) for row in rows)
+    is_closed = is_poll_expired(poll)
 
     lines = [
         f"📊 {poll['title']}",
-        f"Holati: {'Faol' if poll['status'] == 'active' else 'Yopilgan'}",
+        f"Holati: {'Yopilgan / Yakunlangan' if is_closed else 'Faol'}",
         f"Jami ovozlar: {total}",
         "",
     ]
@@ -377,635 +744,147 @@ async def show_new_results(query, poll_id, context):
     )
 
 
-# =========================================================
-# ADMIN YUBORGAN MATNLARNI QABUL QILISH
-# =========================================================
+async def _finalize_new_poll_creation(message, context):
+    poll_data = context.user_data.get("new_poll", {})
+    title = poll_data.get("title")
+    question = poll_data.get("question")
+    options = poll_data.get("options")
+    photo_file_id = poll_data.get("photo_file_id")
+    ends_at = poll_data.get("ends_at")
 
-async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-    if not update.message or not update.message.text:
-        return
-
-    action = context.user_data.get("admin_action")
-    if not action:
-        return
-
-    text = update.message.text.strip()
-    if not text:
-        await update.message.reply_text("Matn bo'sh bo'lmasligi kerak.")
-        return
-
-    if action == "poll_title":
-        if len(text) > 200:
-            await update.message.reply_text("Opros nomi 200 belgidan oshmasin.")
-            return
-        context.user_data.setdefault("new_poll", {})["title"] = text
-        context.user_data["admin_action"] = "poll_question"
-        await update.message.reply_text("❓ Endi opros savolini yuboring:")
-        return
-
-    if action == "poll_question":
-        if len(text) > 1000:
-            await update.message.reply_text("Savol 1000 belgidan oshmasin.")
-            return
-        context.user_data.setdefault("new_poll", {})["question"] = text
-        context.user_data["admin_action"] = "poll_options"
-        await update.message.reply_text(
-            "📝 Javob variantlarini yuboring.\n\n"
-            "Har bir variantni alohida qatorda yozing.\n"
-            "Kamida 2 ta, ko'pi bilan 50 ta variant kiriting."
-        )
-        return
-
-    if action == "poll_options":
-        options = [item.strip() for item in text.splitlines() if item.strip()]
-        if len(options) < 2 or len(options) > 50:
-            await update.message.reply_text(
-                "Kamida 2 ta va ko'pi bilan 50 ta variant kiriting."
-            )
-            return
-        if any(len(item) > 64 for item in options):
-            await update.message.reply_text(
-                "Har bir variant 64 belgidan oshmasin."
-            )
-            return
-        if len(set(options)) != len(options):
-            await update.message.reply_text("Takroriy variantlar kiritilmang.")
-            return
-
-        poll_data = context.user_data.get("new_poll", {})
-        if not poll_data.get("title") or not poll_data.get("question"):
-            context.user_data.pop("new_poll", None)
-            context.user_data.pop("admin_action", None)
-            await update.message.reply_text(
-                "Opros ma'lumotlari topilmadi. Iltimos, qaytadan boshlang.",
-                reply_markup=admin_keyboard(),
-            )
-            return
-
-        try:
-            bot_info = await context.bot.get_me()
-            poll_id = create_poll(
-                poll_data["title"],
-                poll_data["question"],
-                options,
-            )
-            link = f"https://t.me/{bot_info.username}?start=poll_{poll_id}"
-        except Exception:
-            logger.exception("Yangi opros yaratishda xatolik")
-            await update.message.reply_text(
-                "Opros yaratishda xatolik yuz berdi. Ma'lumotlarni tekshirib, qayta urinib ko'ring."
-            )
-            return
-
+    if not title or not question or not options:
         context.user_data.pop("new_poll", None)
         context.user_data.pop("admin_action", None)
-
-        await update.message.reply_text(
-            "✅ YANGI OPROS YARATILDI!\n\n"
-            f"📌 Nomi: {poll_data['title']}\n"
-            f"❓ Savol: {poll_data['question']}\n"
-            f"📝 Variantlar: {len(options)} ta\n\n"
-            f"🔗 Havola:\n{link}",
+        await message.reply_text(
+            "Opros ma'lumotlari topilmadi. Iltimos, qaytadan boshlang.",
             reply_markup=admin_keyboard(),
         )
         return
 
-    if action == "question":
-        if len(text) > 1000:
-            await update.message.reply_text("Savol 1000 belgidan oshmasin.")
-            return
-        save_setting("question", text)
-        context.user_data.pop("admin_action", None)
-        await update.message.reply_text(
-            "✅ Eski savol yangilandi.\nAvvalgi ovozlar saqlab qolindi.",
-            reply_markup=admin_keyboard(),
-        )
-        return
-
-    if action == "options":
-        options = [item.strip() for item in text.splitlines() if item.strip()]
-        if len(options) < 2 or len(options) > 50:
-            await update.message.reply_text(
-                "Kamida 2 ta va ko'pi bilan 50 ta variant kiriting."
-            )
-            return
-        if any(len(item) > 64 for item in options):
-            await update.message.reply_text(
-                "Har bir variant 64 belgidan oshmasin."
-            )
-            return
-        if len(set(options)) != len(options):
-            await update.message.reply_text("Takroriy variantlar mavjud.")
-            return
-
-        save_setting("options", json.dumps(options, ensure_ascii=False))
-        context.user_data.pop("admin_action", None)
-        await update.message.reply_text(
-            "✅ Eski variantlar yangilandi.\nAvvalgi ovozlar o'chirilmadi.",
-            reply_markup=admin_keyboard(),
-        )
-
-
-# =========================================================
-# KANALGA A'ZOLIKNI TEKSHIRISH
-# =========================================================
-
-async def is_subscriber(bot, user_id):
     try:
-        member = await bot.get_chat_member(CHANNEL, user_id)
-        return (
-            member.status in ("creator", "administrator", "member")
-            or (
-                member.status == "restricted"
-                and bool(getattr(member, "is_member", False))
-            )
+        bot_info = await context.bot.get_me()
+        poll_id = create_poll(
+            title,
+            question,
+            options,
+            photo_file_id=photo_file_id,
+            ends_at=ends_at,
         )
+        link = f"https://t.me/{bot_info.username}?start=poll_{poll_id}"
     except Exception:
-        logger.exception(
-            "Kanal a'zoligini tekshirishda xatolik. "
-            "Bot kanalga administrator sifatida qo'shilganini tekshiring."
-        )
-        return False
-
-
-def subscription_keyboard(callback_data):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ A'zolikni tekshirish", callback_data=callback_data)],
-    ])
-
-
-# =========================================================
-# START VA DEEP-LINK
-# =========================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    if context.args and context.args[0].startswith("poll_"):
-        raw_id = context.args[0][5:]
-        try:
-            poll_id = int(raw_id)
-            if poll_id <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Opros havolasi noto'g'ri.")
-            return
-
-        poll = get_poll(poll_id)
-        if not poll or poll["status"] != "active":
-            await update.message.reply_text("Bu opros mavjud emas yoki yopilgan.")
-            return
-
-        await update.message.reply_text(
-            f"📊 {poll['title']}\n\n"
-            f"❓ {poll['question']}\n\n"
-            "Ovoz berish uchun avval kanalimizga a'zo bo'ling.",
-            reply_markup=subscription_keyboard(f"check_poll_{poll_id}"),
+        logger.exception("Yangi opros yaratishda xatolik")
+        await message.reply_text(
+            "Opros yaratishda xatolik yuz berdi. Ma'lumotlarni tekshirib, qayta urinib ko'ring."
         )
         return
 
-    await update.message.reply_text(
-        "Assalomu alaykum!\n\n"
-        "Ovoz berishda qatnashish uchun avval kanalimizga a'zo bo'ling.",
-        reply_markup=subscription_keyboard("check"),
-    )
-
-
-# =========================================================
-# ESKI OPROS VA NATIJALAR
-# =========================================================
-
-def legacy_user_has_voted(user_id):
-    conn = legacy_db()
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM votes WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
-
-
-async def show_old_poll(query, page=0):
-    options = get_options()
-    question = get_question()
-    page_count = max(1, ceil(len(options) / OLD_POLL_PAGE_SIZE))
-    page = max(0, min(page, page_count - 1))
-
-    if legacy_user_has_voted(query.from_user.id):
-        await query.edit_message_text(
-            "✅ Siz ushbu eski ovoz berishda avval qatnashgansiz.\n\n"
-            "Rahmat!"
-        )
-        return
-
-    start_index = page * OLD_POLL_PAGE_SIZE
-    page_options = options[start_index:start_index + OLD_POLL_PAGE_SIZE]
-
-    keyboard = []
-    for index, option in enumerate(page_options, start=start_index):
-        keyboard.append([InlineKeyboardButton(
-            option,
-            callback_data=f"vote_{index}",
-        )])
-
-    navigation = []
-    if page > 0:
-        navigation.append(InlineKeyboardButton(
-            "⬅️ Oldingi", callback_data=f"poll_page_{page - 1}"
-        ))
-    if page < page_count - 1:
-        navigation.append(InlineKeyboardButton(
-            "Keyingi ➡️", callback_data=f"poll_page_{page + 1}"
-        ))
-    if navigation:
-        keyboard.append(navigation)
-
-    await query.edit_message_text(
-        f"📊 ESKI OVOZ BERISH\n\n❓ {question}\n\n"
-        "Javobingizni tanlang:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def show_old_results(target, edit_first=False, context=None):
-    conn = legacy_db()
-    try:
-        rows = conn.execute(
-            """
-            SELECT choice, COUNT(*) AS vote_count
-            FROM votes
-            GROUP BY choice
-            ORDER BY choice
-            """
-        ).fetchall()
-        total = conn.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
-    finally:
-        conn.close()
-
-    counts = {row["choice"]: int(row["vote_count"]) for row in rows}
-    options = get_options()
-    for choice in counts:
-        if choice not in options:
-            options.append(choice)
-
-    lines = [
-        "📊 ESKI OVOZ BERISH NATIJALARI",
-        f"Jami ovozlar: {total}",
-        "",
-    ]
-
-    for option in options:
-        count = counts.get(option, 0)
-        percent = count / total * 100 if total else 0
-        lines.extend([f"▪️ {option}", f"{count} ta ({percent:.1f}%)", ""])
-
-    text = "\n".join(lines)
-
-    if edit_first and context is not None:
-        await send_result_chunks_from_query(target, context, text)
-    else:
-        await send_result_chunks_from_message(target, text, edit_first=edit_first)
-
-
-async def results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "Bu buyruq faqat administrator uchun."
-        )
-        return
-    await show_old_results(update.effective_message)
-
-
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        f"Sizning Telegram ID raqamingiz: {update.effective_user.id}"
-    )
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not is_admin(update.effective_user.id):
-        return
-
-    context.user_data.pop("admin_action", None)
     context.user_data.pop("new_poll", None)
-    await update.effective_message.reply_text(
-        "❌ Amal bekor qilindi.",
+    context.user_data.pop("admin_action", None)
+
+    extra_info = []
+    if ends_at:
+        extra_info.append(f"⏰ Tugash vaqti: {ends_at}")
+    if photo_file_id:
+        extra_info.append("🖼 Rasm: Biriktirilgan")
+    extra_block = ("\n" + "\n".join(extra_info)) if extra_info else ""
+
+    await message.reply_text(
+        "✅ YANGI OPROS YARATILDI!\n\n"
+        f"📌 Nomi: {title}\n"
+        f"❓ Savol: {question}\n"
+        f"📝 Variantlar: {len(options)} ta"
+        f"{extra_block}\n\n"
+        f"🔗 Havola:\n{link}",
         reply_markup=admin_keyboard(),
     )
 
 
 # =========================================================
-# CALLBACK TUGMALARI
+# MATNLAR VA RASMLARNI QABUL QILISH
 # =========================================================
 
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query is None:
+async def handle_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+    if not update.message or not update.message.photo:
         return
 
-    user_id = query.from_user.id
-    data = query.data or ""
+    action = context.user_data.get("admin_action")
+    if action != "poll_photo":
+        return
 
-    # ADMIN CALLBACKLARI
-    if data.startswith("admin_"):
-        if not is_admin(user_id):
-            await query.answer("Ruxsat yo'q!", show_alert=True)
+    photo = update.message.photo[-1]
+    context.user_data.setdefault("new_poll", {})["photo_file_id"] = photo.file_id
+    context.user_data["admin_action"] = "poll_ends_at"
+
+    await update.message.reply_text(
+        "⏰ Tugash vaqtini yuboring (masalan: 25.11.2026 23:59).\n"
+        "Muddat belgilamaslik uchun '-' yuboring.\n\n"
+        "Bekor qilish: /cancel"
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    # 1. ADMIN JARAYONLARI
+    action = context.user_data.get("admin_action")
+    if action and is_admin(user_id):
+        if action == "poll_title":
+            if len(text) > 200:
+                await update.message.reply_text("Opros nomi 200 belgidan oshmasin.")
+                return
+            context.user_data.setdefault("new_poll", {})["title"] = text
+            context.user_data["admin_action"] = "poll_question"
+            await update.message.reply_text("❓ Endi opros savolini yuboring:")
             return
 
-        await query.answer()
-
-        if data == "admin_new_poll":
-            await new_poll_start(query, context)
-            return
-
-        if data == "admin_all_polls":
-            await show_all_polls(query, 0)
-            return
-
-        if data.startswith("admin_polls_page_"):
-            try:
-                page = int(data[len("admin_polls_page_"):])
-                await show_all_polls(query, page)
-            except ValueError:
-                await query.edit_message_text("Sahifa raqami noto'g'ri.")
-            return
-
-        if data.startswith("admin_view_poll_"):
-            try:
-                poll_id = int(data[len("admin_view_poll_"):])
-                await show_poll_details(query, poll_id, context)
-            except ValueError:
-                await query.edit_message_text("Opros ID noto'g'ri.")
-            return
-
-        if data.startswith("admin_poll_results_"):
-            try:
-                poll_id = int(data[len("admin_poll_results_"):])
-                await show_new_results(query, poll_id, context)
-            except ValueError:
-                await query.edit_message_text("Opros ID noto'g'ri.")
-            return
-
-        if data.startswith("admin_close_poll_"):
-            try:
-                poll_id = int(data[len("admin_close_poll_"):])
-                poll = get_poll(poll_id)
-                if poll is None:
-                    await query.edit_message_text("Opros topilmadi.")
-                else:
-                    close_poll(poll_id)
-                    await show_poll_details(query, poll_id, context)
-            except ValueError:
-                await query.edit_message_text("Opros ID noto'g'ri.")
-            return
-
-        if data == "admin_question":
-            context.user_data["admin_action"] = "question"
-            await query.edit_message_text(
-                "✏️ Yangi savolni yuboring.\n\nBekor qilish: /cancel"
+        if action == "poll_question":
+            if len(text) > 1000:
+                await update.message.reply_text("Savol 1000 belgidan oshmasin.")
+                return
+            context.user_data.setdefault("new_poll", {})["question"] = text
+            context.user_data["admin_action"] = "poll_options"
+            await update.message.reply_text(
+                "📝 Javob variantlarini yuboring.\n\n"
+                "Har bir variantni alohida qatorda yozing.\n"
+                "Kamida 2 ta, ko'pi bilan 50 ta variant kiriting."
             )
             return
 
-        if data == "admin_options":
-            context.user_data["admin_action"] = "options"
-            await query.edit_message_text(
-                "📝 Yangi javob variantlarini alohida qatorlarda yuboring.\n\n"
+        if action == "poll_options":
+            options = [item.strip() for item in text.splitlines() if item.strip()]
+            if len(options) < 2 or len(options) > 50:
+                await update.message.reply_text(
+                    "Kamida 2 ta va ko'pi bilan 50 ta variant kiriting."
+                )
+                return
+            if any(len(item) > 64 for item in options):
+                await update.message.reply_text(
+                    "Har bir variant 64 belgidan oshmasin."
+                )
+                return
+            if len(set(options)) != len(options):
+                await update.message.reply_text("Takroriy variantlar kiritilmang.")
+                return
+
+            context.user_data.setdefault("new_poll", {})["options"] = options
+            context.user_data["admin_action"] = "poll_photo"
+            await update.message.reply_text(
+                "🖼 So'rovnoma uchun banner rasm yuboring.\n"
+                "Rasm qo'shmaslik uchun '-' yuboring.\n\n"
                 "Bekor qilish: /cancel"
             )
             return
 
-        if data == "admin_results":
-            await show_old_results(query.message, edit_first=True)
-            return
-
-        if data == "admin_back":
-            context.user_data.pop("admin_action", None)
-            context.user_data.pop("new_poll", None)
-            await query.edit_message_text(
-                "⚙️ ADMIN BOSHQARUV PANELI",
-                reply_markup=admin_keyboard(),
-            )
-            return
-
-        if data == "admin_cancel":
-            context.user_data.pop("admin_action", None)
-            context.user_data.pop("new_poll", None)
-            await query.edit_message_text(
-                "❌ Amal bekor qilindi.",
-                reply_markup=admin_keyboard(),
-            )
-            return
-
-        return
-
-    # ESKI OPROS SAHIFALARI
-    if data.startswith("poll_page_"):
-        await query.answer()
-        try:
-            page = int(data[len("poll_page_"):])
-            await show_old_poll(query, page)
-        except ValueError:
-            await query.edit_message_text("Sahifa raqami noto'g'ri.")
-        return
-
-    # YANGI OPROS: A'ZOLIKNI TEKSHIRISH
-    if data.startswith("check_poll_"):
-        try:
-            poll_id = int(data[len("check_poll_"):])
-            if poll_id <= 0:
-                raise ValueError
-        except ValueError:
-            await query.answer("Opros ID noto'g'ri.", show_alert=True)
-            return
-
-        poll = get_poll(poll_id)
-        if not poll or poll["status"] != "active":
-            await query.answer("Bu opros yopilgan yoki mavjud emas.", show_alert=True)
-            return
-
-        if not await is_subscriber(context.bot, user_id):
-            await query.answer("Avval kanalga a'zo bo'ling!", show_alert=True)
-            return
-
-        await query.answer("A'zolik tasdiqlandi!")
-        keyboard = [
-            [InlineKeyboardButton(
-                option["option_text"],
-                callback_data=f"new_vote_{poll_id}_{option['id']}",
-            )]
-            for option in poll["options"]
-        ]
-
-        await query.edit_message_text(
-            f"📊 {poll['title']}\n\n"
-            f"❓ {poll['question']}\n\n"
-            "Javobingizni tanlang:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    # ESKI OPROS: A'ZOLIKNI TEKSHIRISH
-    if data == "check":
-        if not await is_subscriber(context.bot, user_id):
-            await query.answer("Avval kanalga a'zo bo'ling!", show_alert=True)
-            return
-
-        await query.answer("A'zolik tasdiqlandi!")
-        await show_old_poll(query, 0)
-        return
-
-    # YANGI OPROS: OVOZ BERISH
-    if data.startswith("new_vote_"):
-        try:
-            parts = data.split("_")
-            if len(parts) != 4:
-                raise ValueError
-            poll_id = int(parts[2])
-            option_id = int(parts[3])
-            if poll_id <= 0 or option_id <= 0:
-                raise ValueError
-        except ValueError:
-            await query.answer("Ovoz ma'lumoti noto'g'ri.", show_alert=True)
-            return
-
-        if not await is_subscriber(context.bot, user_id):
-            await query.answer(
-                "Ovoz berish uchun kanalga a'zo bo'ling!",
-                show_alert=True,
-            )
-            return
-
-        try:
-            vote_result = cast_vote(poll_id, user_id, option_id)
-        except Exception:
-            logger.exception("Ovoz saqlashda xatolik")
-            await query.answer(
-                "Ovoz saqlanmadi. Iltimos, keyinroq urinib ko'ring.",
-                show_alert=True,
-            )
-            return
-
-        if vote_result == "success":
-            await query.answer("Ovozingiz qabul qilindi!")
-            await query.edit_message_text("✅ Ovozingiz muvaffaqiyatli qabul qilindi!")
-        elif vote_result == "already_voted":
-            await query.answer(
-                "Siz bu oprosda avval ovoz bergansiz!",
-                show_alert=True,
-            )
-        elif vote_result == "closed":
-            await query.answer("Bu opros yopilgan!", show_alert=True)
-        else:
-            await query.answer("Javob varianti topilmadi!", show_alert=True)
-        return
-
-    # ESKI OPROS: OVOZ BERISH
-    if data.startswith("vote_"):
-        if not await is_subscriber(context.bot, user_id):
-            await query.answer(
-                "Ovoz berish uchun kanalga a'zo bo'ling!",
-                show_alert=True,
-            )
-            return
-
-        try:
-            index = int(data[len("vote_"):])
-            options = get_options()
-            if index < 0 or index >= len(options):
-                raise ValueError
-            choice = options[index]
-        except (ValueError, IndexError):
-            await query.answer("Javob varianti mavjud emas.", show_alert=True)
-            return
-
-        conn = legacy_db()
-        try:
-            conn.execute(
-                "INSERT INTO votes (user_id, choice) VALUES (?, ?)",
-                (user_id, choice),
-            )
-            conn.commit()
-            await query.answer("Ovozingiz qabul qilindi!")
-            await query.edit_message_text(
-                "✅ Ovozingiz qabul qilindi!\n\n"
-                f"Tanlovingiz: {choice}"
-            )
-        except sqlite3.IntegrityError:
-            await query.answer(
-                "Siz avval ovoz bergansiz!",
-                show_alert=True,
-            )
-        except Exception:
-            conn.rollback()
-            logger.exception("Eski ovozni saqlashda xatolik")
-            await query.answer(
-                "Ovoz saqlanmadi. Iltimos, keyinroq urinib ko'ring.",
-                show_alert=True,
-            )
-        finally:
-            conn.close()
-        return
-
-    await query.answer("Noma'lum tugma.", show_alert=True)
-
-
-# =========================================================
-# XATOLARNI QAYD ETISH
-# =========================================================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    error = context.error
-    if error is not None:
-        logger.error(
-            "Botda ishlov berilmagan xatolik yuz berdi",
-            exc_info=(type(error), error, error.__traceback__),
-        )
-
-
-# =========================================================
-# BOTNI ISHGA TUSHIRISH
-# =========================================================
-
-def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN Railway Variables bo'limida belgilanmagan.")
-    if ADMIN_ID <= 0:
-        raise RuntimeError("ADMIN_ID to'g'ri Telegram ID bilan belgilanmagan.")
-    if not CHANNEL or not CHANNEL_LINK:
-        raise RuntimeError("CHANNEL va CHANNEL_LINK sozlamalarini tekshiring.")
-
-    logger.info("Ma'lumotlar bazasi tayyorlanmoqda: %s", os.path.abspath(DB_PATH))
-
-    # Ikkala tizim ham bir xil SQLite faylidan foydalanadi.
-    # Bu funksiyalar mavjud legacy votes jadvalidagi yozuvlarni o'chirmaydi.
-    init_legacy_db()
-    init_db()
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_menu))
-    app.add_handler(CommandHandler("natija", results))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_admin_text,
-        )
-    )
-    app.add_error_handler(error_handler)
-
-    logger.info("Telegram bot ishga tushmoqda...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+        if action == "poll_photo":
+            if text == "-":
+                context.user_data.setdefault("new_poll", {})["photo_file_id"] = None
+                context.user_data["admin_action"] = "poll_ends_at"
+                await update.message
