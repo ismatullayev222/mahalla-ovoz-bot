@@ -37,9 +37,27 @@ def get_db():
         conn.close()
 
 
+def _ensure_column(conn, table_name, column_name, column_def):
+    """Safely add a column to an existing table if it is missing."""
+    columns = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing_names = {col["name"] for col in columns}
+    if column_name not in existing_names:
+        conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}"
+        )
+
+
 def init_db():
-    """Create only the new-poll tables; never alter the legacy votes table."""
+    """Create only the new-poll and user tables; never alter the legacy votes table."""
     with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                phone_number TEXT NOT NULL,
+                verified_at TEXT NOT NULL
+            )
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS polls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,6 +68,9 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+
+        _ensure_column(conn, "polls", "photo_file_id", "TEXT")
+        _ensure_column(conn, "polls", "ends_at", "TEXT")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS options (
@@ -85,10 +106,41 @@ def init_db():
         """)
 
 
-def create_poll(title, question, options):
+def save_user_phone(user_id, phone_number):
+    """Save or update a user's verified phone number."""
+    phone = str(phone_number).strip()
+    if not phone:
+        raise ValueError("Telefon raqami bo'sh bo'lmasligi kerak.")
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, phone_number, verified_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                phone_number = excluded.phone_number,
+                verified_at = excluded.verified_at
+            """,
+            (int(user_id), phone, now_utc()),
+        )
+
+
+def get_user_phone(user_id):
+    """Return verified phone number if present, else None."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT phone_number FROM users WHERE user_id = ?",
+            (int(user_id),),
+        ).fetchone()
+        return row["phone_number"] if row else None
+
+
+def create_poll(title, question, options, photo_file_id=None, ends_at=None):
     title = str(title).strip()
     question = str(question).strip()
     options = [str(item).strip() for item in options if str(item).strip()]
+    photo_file_id = str(photo_file_id).strip() if photo_file_id else None
+    ends_at = str(ends_at).strip() if ends_at else None
 
     if not title or len(title) > 200:
         raise ValueError("Opros nomi 1–200 belgi bo'lishi kerak.")
@@ -106,10 +158,10 @@ def create_poll(title, question, options):
     with get_db() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO polls (title, question, status, created_at)
-            VALUES (?, ?, 'active', ?)
+            INSERT INTO polls (title, question, status, created_at, photo_file_id, ends_at)
+            VALUES (?, ?, 'active', ?, ?, ?)
             """,
-            (title, question, now_utc()),
+            (title, question, now_utc(), photo_file_id, ends_at),
         )
         poll_id = cursor.lastrowid
 
@@ -156,6 +208,8 @@ def get_all_polls():
                 p.question,
                 p.status,
                 p.created_at,
+                p.photo_file_id,
+                p.ends_at,
                 COUNT(v.id) AS total_votes
             FROM polls AS p
             LEFT JOIN poll_votes AS v ON v.poll_id = p.id
